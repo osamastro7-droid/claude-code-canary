@@ -1,0 +1,227 @@
+# Claude Code canary for the Temporal Claude Agent SDK plugin.
+#
+# Every day, and on demand, this takes the newest Claude Code on npm and runs the
+# plugin's whole test suite with it on Linux, macOS and Windows. The suite's
+# real-engine tests drive that exact engine. A version and plugin commit that passed
+# once are not run again. A failed run is red, and GitHub notifies the repo owner.
+name: Claude Code canary
+
+on:
+  schedule:
+    # 20:37 UTC: Claude Code releases usually land between 16:00 and 19:00 UTC.
+    - cron: "37 20 * * *"
+  workflow_dispatch:
+    inputs:
+      claude_code:
+        description: Claude Code version, like 2.1.288 (empty means the newest on npm)
+        type: string
+        default: ""
+      plugin_ref:
+        description: Ref of temporalio/ai-integrations, like refs/heads/main (empty means PLUGIN_REF)
+        type: string
+        default: ""
+      force:
+        description: Run even if this version and plugin commit passed before
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: claude-code-canary
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UPSTREAM: temporalio/ai-integrations
+  # The plugin's pull request. After it is merged: refs/heads/main
+  PLUGIN_REF: refs/pull/33/head
+  PLUGIN_DIR: python/claude_agent_sdk
+
+jobs:
+  pick:
+    name: Pick a version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      sha: ${{ steps.pick.outputs.sha }}
+      key: ${{ steps.pick.outputs.key }}
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - name: The newest Claude Code and the plugin commit
+        id: pick
+        env:
+          WANTED: ${{ inputs.claude_code }}
+          REF: ${{ inputs.plugin_ref }}
+        run: |
+          set -euo pipefail
+          version="${WANTED:-$(npm view @anthropic-ai/claude-code version)}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Not a Claude Code version: '$version'"
+            exit 1
+          fi
+          # A release reaches npm in steps: wait until every platform package is there.
+          ready=true
+          for platform in linux-x64 darwin-arm64 win32-x64; do
+            got=$(npm view "@anthropic-ai/claude-code-$platform@$version" version 2>/dev/null || true)
+            if [ "$got" != "$version" ]; then
+              echo "::notice::@anthropic-ai/claude-code-$platform@$version is not on npm yet. The next run tries again."
+              ready=false
+            fi
+          done
+          ref="${REF:-$PLUGIN_REF}"
+          sha=$(git ls-remote "https://github.com/$UPSTREAM" "$ref" | cut -f1 | head -n 1)
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::$ref is not a ref of $UPSTREAM"
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "sha=$sha"
+            echo "key=passed-claude-code-$version-plugin-$sha"
+            echo "ready=$ready"
+          } >> "$GITHUB_OUTPUT"
+          echo "Claude Code **$version** with the plugin at [${sha:0:7}](https://github.com/$UPSTREAM/commit/$sha) ($ref)." >> "$GITHUB_STEP_SUMMARY"
+      - name: Did this pair pass before?
+        id: seen
+        if: steps.pick.outputs.ready == 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: canary-passed.txt
+          key: ${{ steps.pick.outputs.key }}
+          lookup-only: true
+      - name: Decide
+        id: decide
+        env:
+          READY: ${{ steps.pick.outputs.ready }}
+          SEEN: ${{ steps.seen.outputs.cache-hit }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ "$READY" != true ]; then
+            run=false why="not every platform package is on npm yet"
+          elif [ "$SEEN" = true ] && [ "$FORCE" != true ]; then
+            run=false why="this version and plugin commit passed before"
+          else
+            run=true why="testing it now"
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "Decision: $why." >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: pick
+    if: needs.pick.outputs.run == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      VERSION: ${{ needs.pick.outputs.version }}
+      UV_NO_EDITABLE: "1" # as in the upstream CI: editable installs cannot resolve temporalio.contrib.*
+      UV_LINK_MODE: copy
+      COLUMNS: "120"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.pick.outputs.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.14"
+          version-file: python/claude_agent_sdk/pyproject.toml
+          enable-cache: true
+          cache-dependency-glob: python/claude_agent_sdk/uv.lock
+      - name: Install GNU make (Windows)
+        if: runner.os == 'Windows'
+        run: choco install make -y --no-progress
+      - name: Install the locked environment
+        run: cd "$PLUGIN_DIR" && make sync
+      - name: Put the new Claude Code in place of the bundled one
+        run: |
+          set -euo pipefail
+          platform=$(node -p 'process.platform + "-" + process.arch')
+          cd "$RUNNER_TEMP"
+          tarball=$(npm pack "@anthropic-ai/claude-code-$platform@$VERSION" --silent | tail -n 1)
+          tar -xzf "$tarball"
+          cd "$GITHUB_WORKSPACE/$PLUGIN_DIR"
+          uv run --no-sync python - "$RUNNER_TEMP/package" <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import sys
+          import time
+
+          import claude_agent_sdk
+
+          name = "claude.exe" if os.name == "nt" else "claude"
+          new = pathlib.Path(sys.argv[1]) / name
+          bundled = pathlib.Path(claude_agent_sdk.__file__).parent / "_bundled" / name
+          was = subprocess.run([bundled, "-v"], capture_output=True, text=True)
+          print("bundled before:", was.stdout.strip())
+          # A new file, not a rewrite in place: macOS kills a signed binary whose file
+          # changed under its cached signature.
+          spare = bundled.with_name(name + ".new")
+          shutil.copyfile(new, spare)
+          spare.chmod(0o755)
+          for attempt in range(5):  # a virus scanner on Windows may hold a file briefly
+              try:
+                  os.replace(spare, bundled)
+                  break
+              except PermissionError:
+                  if attempt == 4:
+                      raise
+                  time.sleep(3)
+          now = subprocess.run([bundled, "-v"], capture_output=True, text=True, check=True)
+          print("bundled now:", now.stdout.strip())
+          if not now.stdout.startswith(os.environ["VERSION"] + " "):
+              sys.exit(f"The bundled engine says {now.stdout.strip()!r}, not {os.environ['VERSION']}")
+          PY
+      - name: Test
+        run: |
+          cd "$PLUGIN_DIR"
+          # --no-sync: nothing may reinstall the SDK (and its bundled engine) now.
+          uv run --no-sync pytest -n auto --dist=worksteal -p no:cacheprovider --junit-xml=junit/test.xml
+      - name: Summary
+        if: always()
+        env:
+          OS: ${{ matrix.os }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          echo "Claude Code $VERSION on $OS: $OUTCOME." >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the test report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: junit-${{ matrix.os }}-claude-code-${{ needs.pick.outputs.version }}
+          path: python/claude_agent_sdk/junit
+          if-no-files-found: ignore
+
+  record:
+    name: Record the pass
+    needs: [pick, test]
+    if: needs.test.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write the record
+        env:
+          VERSION: ${{ needs.pick.outputs.version }}
+          SHA: ${{ needs.pick.outputs.sha }}
+        run: |
+          echo "$VERSION $SHA" > canary-passed.txt
+          echo "Passed on Linux, macOS and Windows. Recorded, so this pair does not run again." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: canary-passed.txt
+          key: ${{ needs.pick.outputs.key }}
